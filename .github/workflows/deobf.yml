@@ -11,8 +11,8 @@ on:
         description: '输出文件路径'
         required: false
         default: 'output/deobf.js'
-      use_deobfuscator:
-        description: '是否使用 deobfuscator 二次还原'
+      use_webcrack:
+        description: '是否使用 webcrack 二次还原'
         required: false
         default: 'true'
         type: choice
@@ -45,9 +45,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: 安装 deobfuscator（可选）
-        if: ${{ github.event.inputs.use_deobfuscator == 'true' }}
-        run: npm install -g deobfuscator
+      - name: 调试环境
+        run: |
+          echo "node: $(which node) $(node -v)"
+          echo "npm:  $(which npm) $(npm -v)"
+          echo "npm prefix: $(npm config get prefix)"
+          echo "python: $(which python) $(python -V)"
 
       - name: 准备输出目录
         run: mkdir -p output
@@ -65,40 +68,49 @@ jobs:
             output/deobf.step1.js \
             output/runtime-dump.json
 
-      - name: 步骤3 - deobfuscator 二次还原（可选）
-        if: ${{ github.event.inputs.use_deobfuscator == 'true' }}
+      - name: 步骤3 - webcrack 二次还原（可选）
+        if: ${{ github.event.inputs.use_webcrack == 'true' }}
         run: |
-          deobfuscator output/deobf.step1.js -o "${{ github.event.inputs.out_file }}"
+          npx --yes webcrack output/deobf.step1.js -o output/deobf.js || {
+            echo "webcrack 失败，使用中间结果"
+            cp output/deobf.step1.js output/deobf.js
+          }
 
-      - name: 兜底 - 无 deobfuscator 时复制中间结果
-        if: ${{ github.event.inputs.use_deobfuscator != 'true' }}
+      - name: 步骤3 - 跳过二次还原
+        if: ${{ github.event.inputs.use_webcrack != 'true' }}
         run: |
-          cp output/deobf.step1.js "${{ github.event.inputs.out_file }}"
+          cp output/deobf.step1.js output/deobf.js
 
-      - name: 显示关键结果
+      - name: 复制到用户指定输出路径
+        if: ${{ github.event.inputs.out_file != 'output/deobf.js' }}
+        run: |
+          mkdir -p "$(dirname "${{ github.event.inputs.out_file }}")"
+          cp output/deobf.js "${{ github.event.inputs.out_file }}"
+
+      - name: 显示反混淆摘要
         run: |
           echo "===== 反混淆摘要 ====="
-          python -c "
+          python - <<'PY'
           import json
           d = json.load(open('output/runtime-dump.json', encoding='utf-8'))
           s = d['summary']
-          print('字符串:', s['stringCount'])
-          print('请求:  ', s['requestCount'])
-          print('发送:  ', s['sendCount'])
-          print('事件:  ', s['eventCount'])
-          print('错误:  ', s['errorCount'])
+          print(f"字符串: {s['stringCount']}")
+          print(f"请求:   {s['requestCount']}")
+          print(f"发送:   {s['sendCount']}")
+          print(f"事件:   {s['eventCount']}")
+          print(f"错误:   {s['errorCount']}")
           print()
-          print('===== 请求 URL =====')
+          print("===== 请求 URL =====")
           for r in d['requests'][:30]:
-              print(r.get('method','GET'), r.get('url',''))
+              print(r.get('method', 'GET'), r.get('url', ''))
           print()
-          print('===== 平台 sources =====')
-          for s in d['sends']:
-              if s.get('event') == 'inited':
-                  srcs = s.get('data', {}).get('sources', {})
+          print("===== 平台 sources =====")
+          for item in d['sends']:
+              if item.get('event') == 'inited':
+                  srcs = item.get('data', {}).get('sources', {})
                   for k, v in srcs.items():
-                      print(k, '->', v.get('name', ''))
-          "
+                      print(f"  {k} -> {v.get('name', '')}")
+          PY
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -107,7 +119,7 @@ jobs:
           path: |
             output/runtime-dump.json
             output/deobf.step1.js
-            ${{ github.event.inputs.out_file }}
+            output/deobf.js
 
       - name: 提交回仓库（可选）
         run: |
