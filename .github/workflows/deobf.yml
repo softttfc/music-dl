@@ -11,14 +11,6 @@ on:
         description: '输出文件路径'
         required: false
         default: 'output/deobf.js'
-      use_webcrack:
-        description: '是否使用 webcrack 二次还原'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
 
 permissions:
   contents: write
@@ -48,69 +40,76 @@ jobs:
       - name: 调试环境
         run: |
           echo "node: $(which node) $(node -v)"
-          echo "npm:  $(which npm) $(npm -v)"
-          echo "npm prefix: $(npm config get prefix)"
           echo "python: $(which python) $(python -V)"
 
       - name: 准备输出目录
         run: mkdir -p output
 
-      - name: 步骤1 - 运行时 hook
+      - name: 步骤1 - 运行时 hook（仅收集信息，不参与替换）
         run: |
           node sources/lx_deobf/runtime_hook.js \
             "${{ github.event.inputs.src_file }}" \
-            output/runtime-dump.json
+            output/runtime-dump.json || echo "[!] runtime hook 失败，继续"
 
-      - name: 步骤2 - 静态反混淆 + 运行时回填
+      - name: 步骤2 - 安全静态反混淆（只传两个参数）
         run: |
           python sources/lx_deobf/jm.py \
             "${{ github.event.inputs.src_file }}" \
-            output/deobf.step1.js \
-            output/runtime-dump.json
+            "${{ github.event.inputs.out_file }}"
 
-      - name: 步骤3 - webcrack 二次还原（可选）
-        if: ${{ github.event.inputs.use_webcrack == 'true' }}
+      - name: 步骤3 - 语法检查
         run: |
-          npx --yes webcrack output/deobf.step1.js -o output/deobf.js || {
-            echo "webcrack 失败，使用中间结果"
-            cp output/deobf.step1.js output/deobf.js
-          }
+          node --check "${{ github.event.inputs.out_file }}"
+          echo "[+] 语法检查通过"
 
-      - name: 步骤3 - 跳过二次还原
-        if: ${{ github.event.inputs.use_webcrack != 'true' }}
+      - name: 步骤4 - 检查是否还有被破坏的特征
         run: |
-          cp output/deobf.step1.js output/deobf.js
+          echo "===== 检查单字符 return ====="
+          if grep -n 'return "[0-9]";' "${{ github.event.inputs.out_file }}"; then
+            echo "[!] 发现被破坏的 return 语句，反混淆可能有问题"
+            exit 1
+          else
+            echo "[+] 未发现被破坏的 return 语句"
+          fi
 
-      - name: 复制到用户指定输出路径
-        if: ${{ github.event.inputs.out_file != 'output/deobf.js' }}
-        run: |
-          mkdir -p "$(dirname "${{ github.event.inputs.out_file }}")"
-          cp output/deobf.js "${{ github.event.inputs.out_file }}"
+          echo "===== 检查明文字符串 ====="
+          grep -n "酷狗\|QQ音乐\|网易云\|酷我\|咪咕" "${{ github.event.inputs.out_file }}" | head || true
 
-      - name: 显示反混淆摘要
+          echo "===== 检查关键结构 ====="
+          grep -n "EVENT_NAMES" "${{ github.event.inputs.out_file }}" | head || true
+          grep -n "globalThis" "${{ github.event.inputs.out_file }}" | head || true
+
+      - name: 步骤5 - 显示反混淆摘要
         run: |
           echo "===== 反混淆摘要 ====="
-          python - <<'PY'
+          if [ -f output/runtime-dump.json ]; then
+            python - <<'PY'
           import json
-          d = json.load(open('output/runtime-dump.json', encoding='utf-8'))
-          s = d['summary']
-          print(f"字符串: {s['stringCount']}")
-          print(f"请求:   {s['requestCount']}")
-          print(f"发送:   {s['sendCount']}")
-          print(f"事件:   {s['eventCount']}")
-          print(f"错误:   {s['errorCount']}")
-          print()
-          print("===== 请求 URL =====")
-          for r in d['requests'][:30]:
-              print(r.get('method', 'GET'), r.get('url', ''))
-          print()
-          print("===== 平台 sources =====")
-          for item in d['sends']:
-              if item.get('event') == 'inited':
-                  srcs = item.get('data', {}).get('sources', {})
-                  for k, v in srcs.items():
-                      print(f"  {k} -> {v.get('name', '')}")
+          try:
+              d = json.load(open('output/runtime-dump.json', encoding='utf-8'))
+              s = d['summary']
+              print(f"字符串: {s['stringCount']}")
+              print(f"请求:   {s['requestCount']}")
+              print(f"发送:   {s['sendCount']}")
+              print(f"事件:   {s['eventCount']}")
+              print(f"错误:   {s['errorCount']}")
+              print()
+              print("===== 请求 URL =====")
+              for r in d['requests'][:30]:
+                  print(r.get('method', 'GET'), r.get('url', ''))
+              print()
+              print("===== 平台 sources =====")
+              for item in d['sends']:
+                  if item.get('event') == 'inited':
+                      srcs = item.get('data', {}).get('sources', {})
+                      for k, v in srcs.items():
+                          print(f"  {k} -> {v.get('name', '')}")
+          except Exception as e:
+              print(f"读取 runtime-dump.json 失败: {e}")
           PY
+          else
+            echo "runtime-dump.json 不存在，跳过"
+          fi
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -118,8 +117,7 @@ jobs:
           name: deobf-result
           path: |
             output/runtime-dump.json
-            output/deobf.step1.js
-            output/deobf.js
+            ${{ github.event.inputs.out_file }}
 
       - name: 提交回仓库（可选）
         run: |
