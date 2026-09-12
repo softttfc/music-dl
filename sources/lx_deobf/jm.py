@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-jm.py - JS 混淆还原工具（支持运行时回填）
+jm.py - JS 混淆还原工具（安全版）
+只做安全的静态字符串还原，不破坏语法结构。
+
 用法:
-    python jm.py 原文件.js [输出文件.js] [runtime-dump.json]
+    python jm.py 原文件.js [输出文件.js]
 """
 
 import re
@@ -112,9 +114,19 @@ def _parse_int(token):
 
 
 # ============================================================
-# 5. 替换 _0x3c40 / _0x58b4 调用
+# 5. 安全替换：只替换参数里含字符串字面量的解码调用
 # ============================================================
-def replace_string_calls(source, decoder, arr_name):
+def replace_string_calls_safe(source, decoder):
+    """
+    只替换形如 _0x3c40(0x1f85, 'xxx') 或 _0x58b4(0x1f85, 'xxx') 的调用。
+    严格条件：
+      - 函数名是 _0x3c40 或 _0x58b4
+      - 第一个参数是数字
+      - 第二个参数是字符串字面量
+      - 不在 return 语句开头
+      - 结果字符串长度 > 1
+    """
+    # 找偏移量
     offsets = {}
     for fn_name in ('_0x3c40', '_0x58b4'):
         pat = re.compile(
@@ -124,39 +136,32 @@ def replace_string_calls(source, decoder, arr_name):
         )
         m = pat.search(source)
         if m:
-            offsets[fn_name] = _parse_int(m.group(1))
+            offsets[fn_name] = _parse_int(m.group(1)) or 0
         else:
-            pat2 = re.compile(
-                r'function\s+' + re.escape(fn_name) + r'\s*\([^)]*\)\s*\{'
-                r'\s*\w+\s*=\s*\w+\s*-\s*\(([^)]+)\)',
-                re.S
-            )
-            m2 = pat2.search(source)
-            if m2:
-                try:
-                    offsets[fn_name] = int(eval(m2.group(1), {"__builtins__": {}}, {}))
-                except Exception:
-                    offsets[fn_name] = 0
-            else:
-                offsets[fn_name] = 0
+            offsets[fn_name] = 0
 
+    # 严格匹配
     call_pat = re.compile(
-        r'(_0x3c40|_0x58b4)\s*\(\s*'
-        r"('?)(0x[0-9a-fA-F]+|\d+)\2\s*,\s*"
-        r"(?:'([^']*)'|\"([^\"]*)\")\s*\)"
+        r'(?<!return\s)'                          # 前面不是 return
+        r'(_0x3c40|_0x58b4)'                      # 函数名
+        r'\s*\(\s*'
+        r"(?:'?(0x[0-9a-fA-F]+|\d+)'?)\s*,\s*"   # 第一个参数：数字
+        r"'((?:[^'\\]|\\.)*)'"                    # 第二个参数：单引号字符串
+        r'\s*\)'
     )
 
     def repl(m):
         fn = m.group(1)
-        idx_token = m.group(3)
-        literal = m.group(4) if m.group(4) is not None else m.group(5)
+        idx_token = m.group(2)
+        literal = m.group(3)
         idx = _parse_int(idx_token)
         if idx is None:
             return m.group(0)
         off = offsets.get(fn, 0)
         real_idx = idx - off
         val = decoder.get(real_idx)
-        if val is None:
+        # 关键：结果长度必须 > 1，否则不替换
+        if val is None or len(val) < 2:
             return m.group(0)
         return json.dumps(val, ensure_ascii=False)
 
@@ -164,66 +169,33 @@ def replace_string_calls(source, decoder, arr_name):
 
 
 # ============================================================
-# 6. 用运行时字符串回填
-# ============================================================
-def replace_with_runtime_strings(source, runtime_strings):
-    candidates = sorted(set(runtime_strings), key=len, reverse=True)
-    call_pat = re.compile(r"(_0x[0-9a-fA-F]{4,8})\s*\(([^()]*)\)")
-
-    def repl(m):
-        args = m.group(2)
-        lits = re.findall(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"", args)
-        lits = [a or b for a, b in lits]
-        if not lits:
-            return m.group(0)
-        joined = "".join(lits)
-        for cand in candidates:
-            if cand and cand in joined:
-                return json.dumps(cand, ensure_ascii=False)
-        for lit in lits:
-            for cand in candidates:
-                if cand and cand == lit:
-                    return json.dumps(cand, ensure_ascii=False)
-        return m.group(0)
-
-    return call_pat.sub(repl, source)
-
-
-# ============================================================
-# 7. 主流程
+# 6. 主流程：只做安全静态还原
 # ============================================================
 def deobfuscate(source):
     strings, arr_name = extract_string_array(source)
     if not strings:
         print("[!] 未找到字符串数组 _0x1f85")
         return source
+
     print(f"[+] 提取到字符串数组: {arr_name}, 共 {len(strings)} 项")
     decoder = StringDecoder(strings)
-    result = replace_string_calls(source, decoder, arr_name)
+
+    result = replace_string_calls_safe(source, decoder)
+
     before = len(re.findall(r'_0x(?:3c40|58b4)\s*\(', source))
     after = len(re.findall(r'_0x(?:3c40|58b4)\s*\(', result))
     print(f"[+] _0x3c40/_0x58b4 调用: {before} -> {after}")
-    return result
 
-
-def deobfuscate_with_runtime(source, runtime_json_path):
-    with open(runtime_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    runtime_strings = data.get("strings", [])
-    print(f"[+] 运行时字符串: {len(runtime_strings)} 条")
-    result = deobfuscate(source)
-    result = replace_with_runtime_strings(result, runtime_strings)
     return result
 
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python jm.py 原文件.js [输出文件.js] [runtime-dump.json]")
+        print("用法: python jm.py 原文件.js [输出文件.js]")
         sys.exit(1)
 
     src_path = sys.argv[1]
     out_path = sys.argv[2] if len(sys.argv) >= 3 else None
-    runtime_path = sys.argv[3] if len(sys.argv) >= 4 else None
 
     if out_path is None:
         base, ext = os.path.splitext(src_path)
@@ -234,10 +206,7 @@ def main():
 
     print(f"[+] 读取: {src_path} ({len(source)} 字符)")
 
-    if runtime_path and os.path.isfile(runtime_path):
-        result = deobfuscate_with_runtime(source, runtime_path)
-    else:
-        result = deobfuscate(source)
+    result = deobfuscate(source)
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(result)
